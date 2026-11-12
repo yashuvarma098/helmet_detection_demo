@@ -8,3 +8,4 @@ __pycache__/
 !.env.example
 output/
 models/*.pt
+!models/best.pt
