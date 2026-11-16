@@ -11,9 +11,6 @@ from collections import defaultdict, deque
 
 from ultralytics import YOLO
 
-# Bicycle skip: Model 2 finds bicycles, riders on them are not helmet-checked.
-from model2.vehicle_detector import BicycleDetector, rides_bicycle, pick_device
-
 
 # ============================================================
 # CONFIG
@@ -26,7 +23,7 @@ MODEL_PATH = Path("models/best.pt")
 
 CONFIDENCE = 0.20
 IMGSZ = 640
-DEVICE = "cpu"
+DEVICE = "mps"
 
 # Dataset classes:
 # 0 = bicyclist
@@ -580,8 +577,6 @@ if model_file is None:
 print(f"Loading local model: {model_file}")
 model = YOLO(str(model_file))
 
-bicycle_detector = BicycleDetector("yolo11n.pt", 0.35, pick_device())
-
 cap = cv2.VideoCapture(CAMERA_INDEX)
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
@@ -688,8 +683,6 @@ try:
 
         raw_frame = frame.copy()
 
-        bicycles = bicycle_detector.detect(frame)
-
         result = model.track(
             frame,
             persist=True,
@@ -736,12 +729,6 @@ try:
         for driver in drivers:
             track_id = driver["track_id"]
             driver_box = driver["box"]
-
-            
-            if rides_bicycle(driver_box, bicycles):
-                history.pop(track_id, None)
-                draw_rider_label(frame, "BICYCLE - SKIPPED", track_id, driver_box, (200, 200, 0))
-                continue
 
             helmet_hits = []
             no_helmet_hits = []
