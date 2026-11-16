@@ -17,9 +17,10 @@ DEFAULT_MODEL1 = HERE.parent / "models" / "best.pt"
 WEIGHTS_DIR = HERE / "weights"                  # Model 2 weights live here, away from Model 1
 
 MODEL2_WEIGHTS = "yolo11n.pt"                   # pretrained COCO model, auto-downloaded once
-BICYCLE_CONF = 0.35
+MODEL2_CONF = 0.35
 M1_CONF = 0.20                                  # same as the live script
 IMGSZ = 640
+VEHICLE_CLASSES = {"bicycle": "Bicycle", "motorcycle": "Motorcycle", "motorbike": "Motorcycle"}
 FALLBACK_IDS = {"driver": 1, "helmet": 2, "no_helmet": 3}   # ids used by the live script
 
 NO_HELMET_CONFIRM_FRAMES = 3
@@ -62,24 +63,32 @@ def load_model2(weights):
     return YOLO(str(target)) if target.exists() else YOLO(weights)
 
 
-class BicycleDetector:
-    """MODEL 2: finds bicycles only."""
+class TwoWheelerDetector:
+    """Detect bicycles and motorcycles with the pretrained COCO model."""
 
-    def __init__(self, weights, conf, device, model=None):    # `model` = test hook
+    def __init__(self, weights, conf, device, model=None):
         self.model = model if model is not None else load_model2(weights)
         self.conf, self.device = conf, device
-        self.ids = [int(i) for i, n in self.model.names.items() if str(n).lower() == "bicycle"]
-        if not self.ids:
-            raise RuntimeError(f"Model 2 has no 'bicycle' class. Classes: {dict(self.model.names)}")
-        print(f"[Model 2] {weights} device={device} conf={conf} bicycle class ids={self.ids}")
+        self.classes = {
+            int(class_id): VEHICLE_CLASSES[str(name).lower()]
+            for class_id, name in self.model.names.items()
+            if str(name).lower() in VEHICLE_CLASSES
+        }
+        if not self.classes:
+            raise RuntimeError(
+                f"Model 2 has no bicycle or motorcycle class. Classes: {dict(self.model.names)}"
+            )
+        print(f"[Model 2] {weights} device={device} conf={conf} classes={self.classes}")
 
     def detect(self, frame):
         r = self.model.predict(frame, conf=self.conf, imgsz=IMGSZ, device=self.device,
-                               classes=self.ids, verbose=False)[0]
+                               classes=list(self.classes), verbose=False)[0]
         out = []
         for b in (r.boxes or []):
-            out.append((tuple(float(v) for v in b.xyxy[0].cpu().numpy()), float(b.conf[0])))
-        return out                                  # [(box, conf), ...]
+            class_id = int(b.cls[0])
+            box = tuple(float(v) for v in b.xyxy[0].cpu().numpy())
+            out.append((self.classes[class_id], box, float(b.conf[0])))
+        return out
 
 
 def resolve_model1_classes(names):
@@ -148,13 +157,16 @@ class Model1Helmet:
 # The one new rule: is this rider on a bicycle?
 # ----------------------------------------------------------------------------
 
-def rides_bicycle(rider, bicycles):
+def rider_on_bicycle(rider, vehicles):
     """True if the rider box sits on top of a detected bicycle box."""
     rx1, ry1, rx2, ry2 = rider
     rw, rh = rx2 - rx1, ry2 - ry1
     if rw <= 0 or rh <= 0:
         return False
-    for (vx1, vy1, vx2, vy2), _ in bicycles:
+    for label, vehicle, _ in vehicles:
+        if label != "Bicycle":
+            continue
+        vx1, vy1, vx2, vy2 = vehicle
         vw, vh = vx2 - vx1, vy2 - vy1
         if vw <= 0 or vh <= 0:
             continue
@@ -173,22 +185,22 @@ def rides_bicycle(rider, bicycles):
 # ----------------------------------------------------------------------------
 
 class HelmetMonitor:
-    def __init__(self, bicycle_detector, helmet_model):
-        self.model2, self.model1 = bicycle_detector, helmet_model
+    def __init__(self, vehicle_detector, helmet_model):
+        self.vehicle_detector, self.model1 = vehicle_detector, helmet_model
         self.history = defaultdict(lambda: deque(maxlen=HISTORY_SIZE))
         self.fined, self.helmet_ids = set(), set()
 
     def process(self, frame):
-        bicycles = self.model2.detect(frame)                  # Model 2 first
-        riders, heads = self.model1.detect(frame)             # then Model 1
+        vehicles = self.vehicle_detector.detect(frame)
+        riders, heads = self.model1.detect(frame)
         views = []
         for tid, box in riders:
-            if rides_bicycle(box, bicycles):                  # bicycle: no helmet detection
+            if rider_on_bicycle(box, vehicles):
                 self.history.pop(tid, None)
                 views.append((tid, box, "HELMET SKIPPED (BICYCLE)", CYAN))
                 continue
             views.append((tid, box) + self._vote(tid, box, heads))
-        return bicycles, views
+        return vehicles, views
 
     def _vote(self, tid, box, heads):
         def inside(h):
@@ -229,11 +241,12 @@ def label_above(frame, text, x, y, color, scale=0.65, thick=2):
                 (255, 255, 255) if color == RED else (0, 0, 0), thick, cv2.LINE_AA)
 
 
-def draw(frame, bicycles, views, monitor, fps):
-    for box, conf in bicycles:
+def draw(frame, vehicles, views, monitor, fps):
+    for label, box, conf in vehicles:
         x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), CYAN, 2)
-        label_above(frame, f"Bicycle {conf:.2f}", x1, y1, CYAN, 0.5, 1)
+        color = CYAN if label == "Bicycle" else (255, 0, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label_above(frame, f"{label} {conf:.2f}", x1, y1, color, 0.5, 1)
     for tid, box, status, color in views:
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
@@ -244,12 +257,32 @@ def draw(frame, bicycles, views, monitor, fps):
                 (255, 255, 255), 2, cv2.LINE_AA)
 
 
+def open_camera(camera_index=None, width=None, height=None):
+    candidates = []
+    if camera_index is None:
+        candidates = [0, 1, 2, 3, 4]
+    else:
+        candidates = [int(camera_index)]
+
+    for idx in candidates:
+        cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+        if not cap.isOpened():
+            continue
+        if width is not None:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height is not None:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        return cap, idx
+    return None, camera_index if camera_index is not None else "auto"
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Helmet detection, bicycles skipped")
+    p = argparse.ArgumentParser(description="Helmet detection with bicycle and motorcycle detection")
     p.add_argument("--model1", nargs="?", const="", default=None,
                    help="path to Model 1 best.pt (default: env HELMET_MODEL_PATH, else models/best.pt)")
-    p.add_argument("--weights", default=MODEL2_WEIGHTS, help="Model 2 (bicycle) weights")
-    p.add_argument("--camera", type=int, default=0)
+    p.add_argument("--weights", default=MODEL2_WEIGHTS, help="Model 2 bicycle/motorcycle weights")
+    p.add_argument("--camera", type=int, default=None,
+                   help="camera index to open; default: first available webcam")
     p.add_argument("--video", default=None, help="video file instead of the webcam")
     p.add_argument("--device", default="auto", help="auto | cpu | cuda:0 | mps")
     p.add_argument("--width", type=int, default=1280)
@@ -262,18 +295,20 @@ def main():
     device = pick_device(args.device)
     m1_path = args.model1 or os.environ.get("HELMET_MODEL_PATH") or DEFAULT_MODEL1
 
-    monitor = HelmetMonitor(BicycleDetector(args.weights, BICYCLE_CONF, device),
+    monitor = HelmetMonitor(TwoWheelerDetector(args.weights, MODEL2_CONF, device),
                             Model1Helmet(m1_path, device))
 
     if args.video:
         cap = cv2.VideoCapture(args.video)
-    else:                                            # DirectShow = faster webcam open on Windows
-        cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW) if os.name == "nt" \
-            else cv2.VideoCapture(args.camera)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        camera_desc = args.video
+    else:
+        cap, camera_desc = open_camera(args.camera, args.width, args.height)
+        if cap is None:
+            print(f"Could not open the default webcam automatically. "
+                  f"Try --camera 0, 1, 2, etc. on your machine.")
+            return 1
     if not cap.isOpened():
-        print(f"Could not open {args.video or 'camera ' + str(args.camera)}. "
+        print(f"Could not open {args.video or 'camera ' + str(camera_desc)}. "
               "Try another --camera index and close apps that use the webcam.")
         return 1
 
@@ -285,12 +320,12 @@ def main():
             if not ok:
                 print("Frame read failed / end of video.")
                 break
-            bicycles, views = monitor.process(frame)
+            vehicles, views = monitor.process(frame)
             now = time.time()
             fps = 1.0 / max(now - prev, 1e-3) if fps == 0 else 0.9 * fps + 0.1 / max(now - prev, 1e-3)
             prev = now
-            draw(frame, bicycles, views, monitor, fps)
-            cv2.imshow("HELMET DETECTION (bicycles skipped)", frame)
+            draw(frame, vehicles, views, monitor, fps)
+            cv2.imshow("TWO-WHEELER AND HELMET DETECTION", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
